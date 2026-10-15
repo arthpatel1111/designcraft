@@ -205,12 +205,16 @@ fn export_pdf_with_report_inner(doc: &Document, cache: &Cache, opts: &PdfOptions
         // group that got past it, with its page.
         crate::pdfx::cmyk_group_spaces(&mut bytes);
     }
-    // Form fields (Buttons and Forms) and, for interactive PDF, video and sound; not in PDF/X.
+    // Form fields (Buttons and Forms) and, for interactive PDF, video and sound; not in PDF/X
+    // or PDF/A: this update comes after krilla's validator ran, and its NeedAppearances fields and
+    // Screen annotations aren't allowed in PDF/A.
     let fields = crate::forms::collect(doc, &sheets);
     let media = if opts.media { crate::forms::collect_media(doc, &sheets) } else { Vec::new() };
     if !fields.is_empty() || !media.is_empty() {
         if opts.standard == Standard::PdfX4 {
             warnings.push("PDF/X-4: form fields and media were left out".into());
+        } else if opts.standard == Standard::PdfA2b {
+            warnings.push("PDF/A-2b: form fields and media were left out".into());
         } else {
             match crate::forms::add_fields(&bytes, &fields, &media) {
                 Some(b) => bytes = b,
@@ -765,7 +769,7 @@ impl Exporter<'_> {
         }
         // Gradient feather: a luminosity mask (white = opaque) over the object.
         let xf = parent * it.xf;
-        let (p0, p1) = gf.points(it.inner_bounds());
+        let (p0, p1) = gf.points(it.feather_bounds());
         let gray = |a: f32| -> krilla::color::Color { luma::Color::new((a.clamp(0.0, 1.0) * 255.0).round() as u8).into() };
         let stops = vec![
             Stop { offset: NormalizedF32::ZERO, color: gray(gf.start), opacity: NormalizedF32::ONE },
@@ -780,7 +784,7 @@ impl Exporter<'_> {
                 cx: p0.x as f32,
                 cy: p0.y as f32,
                 cr: r,
-                transform: Transform::identity(),
+                transform: tf(xf),
                 spread_method: SpreadMethod::Pad,
                 stops,
                 anti_alias: false,
@@ -792,22 +796,21 @@ impl Exporter<'_> {
                 y1: p0.y as f32,
                 x2: p1.x as f32,
                 y2: p1.y as f32,
-                transform: Transform::identity(),
+                transform: tf(xf),
                 spread_method: SpreadMethod::Pad,
                 stops,
                 anti_alias: false,
             }
             .into()
         };
-        let area = it.inner_bounds().inflate(it.stroke.extent() + 4.0, it.stroke.extent() + 4.0);
+        // The gradient keeps its item-space geometry, but its mask covers the complete exported
+        // area (including bleed), so distant child shadows and thick strokes are never cut off.
         let mut sb = s.stream_builder();
         let mut ms = sb.surface();
-        ms.push_transform(&tf(xf));
-        if let Some(p) = to_path(&area.to_path(0.1)) {
+        if let Some(p) = to_path(&self.clip.to_path(0.1)) {
             ms.set_fill(Some(Fill { paint, opacity: NormalizedF32::ONE, rule: FillRule::NonZero }));
             ms.draw_path(&p);
         }
-        ms.pop();
         ms.finish();
         let stream = sb.finish();
         s.push_mask(krilla::mask::Mask::new(stream, krilla::mask::MaskType::Luminosity));
@@ -1031,11 +1034,10 @@ impl Exporter<'_> {
             let v = fill.gradient_vector;
             return Some(match kind {
                 GradientKind::Radial => {
-                    let (c, r) = match v {
-                        Some([x0, y0, x1, y1]) => (designcraft_geom::Point::new(x0, y0), Vec2::new(x1 - x0, y1 - y0).hypot()),
-                        None => (c, bounds.width().max(bounds.height()) / 2.0),
-                    };
-                    let r = r.max(1e-3) as f32;
+                    // A circle stretched into the object's ellipse, as on screen.
+                    let (c, rx, ry) = fill.radial_ellipse(bounds);
+                    let rx = rx.max(1e-3);
+                    let stretch = Affine::translate(c.to_vec2()) * Affine::scale_non_uniform(1.0, ry / rx) * Affine::translate(-c.to_vec2());
                     let (cx, cy) = (c.x as f32, c.y as f32);
                     RadialGradient {
                         fx: cx,
@@ -1043,8 +1045,8 @@ impl Exporter<'_> {
                         fr: 0.0,
                         cx,
                         cy,
-                        cr: r,
-                        transform: Transform::identity(),
+                        cr: rx as f32,
+                        transform: tf(stretch),
                         spread_method: SpreadMethod::Pad,
                         stops,
                         anti_alias: false,
@@ -1188,7 +1190,8 @@ impl Exporter<'_> {
     /// A placed PDF as krilla embeds it. krilla refuses a PDF newer than the file it writes (the
     /// export fails at the end with `VersionMismatch(Pdf17)`), and PDF/X-4 is PDF 1.6 while
     /// VectorCraft and most tools write 1.7. PDF 1.7 changed nothing in how a page draws, so a 1.7
-    /// file goes in as 1.6 (its header relabelled, as `qpdf --force-version=1.6` does). A newer
+    /// file goes in as 1.6 (its header and catalog `/Version` relabelled, as
+    /// `qpdf --force-version=1.6` does). A newer
     /// file is left out and the export fails naming it ([`Exporter::check_placed_versions`]).
     fn placed_pdf(&mut self, asset: &designcraft_doc::Asset) -> Option<krilla::pdf::PdfDocument> {
         use hayro_syntax::PdfVersion as V;
@@ -1209,8 +1212,8 @@ impl Exporter<'_> {
         }
         if have == V::Pdf17
             && max == V::Pdf16
-            && let Some(bytes) = relabel_pdf_header(&asset.data, b"%PDF-1.7", b"%PDF-1.6")
-            && let Ok(pdf) = krilla::pdf::Pdf::new(Arc::new(bytes))
+            && let bytes = relabel_pdf_header(&asset.data, b"%PDF-1.7", b"%PDF-1.6").unwrap_or_else(|| asset.data.to_vec())
+            && let Ok(pdf) = krilla::pdf::Pdf::new(Arc::new(relabel_catalog_version(bytes)))
             && pdf.version() <= max
         {
             self.warn(format!("{}: a PDF 1.7 placed in a PDF 1.6 file, embedded as PDF 1.6", asset.name));
@@ -1374,6 +1377,30 @@ fn relabel_pdf_header(data: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
     let mut out = data.to_vec();
     out.get_mut(at..at + to.len())?.copy_from_slice(to);
     Some(out)
+}
+
+/// `data` with every `/Version /1.7` changed to `/Version /1.6` in place, so the xref offsets
+/// hold. The catalog's `/Version` wins over the header (TCPDF writes both), so relabelling the
+/// header alone leaves the file a PDF 1.7. A catalog inside a compressed object stream is left as
+/// it is, and the version check still names the file.
+fn relabel_catalog_version(mut data: Vec<u8>) -> Vec<u8> {
+    const KEY: &[u8] = b"/Version";
+    let mut from = 0;
+    while let Some(at) = data.get(from..).and_then(|rest| rest.windows(KEY.len()).position(|w| w == KEY)) {
+        let mut i = from + at + KEY.len();
+        while data.get(i).is_some_and(|b| b" \t\r\n\x0c\0".contains(b)) {
+            i += 1;
+        }
+        let ends = data.get(i + 4).is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'.');
+        if data.get(i..i + 4) == Some(b"/1.7".as_slice())
+            && ends
+            && let Some(b) = data.get_mut(i + 3)
+        {
+            *b = b'6';
+        }
+        from = i;
+    }
+    data
 }
 
 /// The sRGB profile (ICC v2.1) that untagged RGB images carry in PDF/X-4.
