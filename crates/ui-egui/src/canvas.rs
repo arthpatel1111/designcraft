@@ -174,6 +174,38 @@ pub fn current_page(app: &DesignApp) -> Option<usize> {
     Some(st.doc.first_page_of_spread(si) + pi)
 }
 
+/// The spread (document or parent) under the view centre and the page index within it: where
+/// commands that act "on the page I am working on" should go.
+pub fn current_spread_page(app: &DesignApp) -> Option<(SpreadRef, usize)> {
+    let st = app.session.active()?;
+    let layout = CanvasLayout::new(&st.doc, st.editing_parents);
+    let i = current_slot(app, &layout)?;
+    let slot = layout.slots.get(i)?;
+    let v = app.view()?;
+    let r = app.canvas_rect?;
+    let c = slot.to_spread(Point::new(v.origin.x + r.width() as f64 / 2.0 / v.zoom, slot.bounds.center().y));
+    let pg = st.doc.spread(slot.spread)?.page_at_x(c.x).unwrap_or(0);
+    Some((slot.spread, pg))
+}
+
+/// While parent spreads are being edited: (parent spread index, page index within it) under the
+/// view centre. `None` when document pages are shown.
+pub fn current_parent_page(app: &DesignApp) -> Option<(usize, usize)> {
+    let st = app.session.active()?;
+    if !st.editing_parents {
+        return None;
+    }
+    let layout = CanvasLayout::new(&st.doc, true);
+    let i = current_slot(app, &layout)?;
+    let slot = layout.slots.get(i)?;
+    let SpreadRef::Parent(pi) = slot.spread else { return None };
+    let v = app.view()?;
+    let r = app.canvas_rect?;
+    let c = slot.to_spread(Point::new(v.origin.x + r.width() as f64 / 2.0 / v.zoom, slot.bounds.center().y));
+    let qi = st.doc.parents.get(pi)?.page_at_x(c.x).unwrap_or(0);
+    Some((pi, qi))
+}
+
 /// Scroll so absolute page `abs` is centred (keeps zoom).
 pub fn go_to_page(app: &mut DesignApp, abs: usize) {
     let Some(st) = app.session.active() else { return };
@@ -385,7 +417,8 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         } else {
             app.session.cursor(xf.to_canvas(p), ui.input(|i| mods(i, false)), app.view_info())
         };
-        ui.ctx().set_cursor_icon(cursor_icon(c));
+        let icon = crate::cursors::show(ui.ctx(), &mut app.cursors, c, p);
+        ui.ctx().set_cursor_icon(icon);
         draw_cursor_badge(&painter, p, c, &t);
     }
 }
@@ -416,32 +449,6 @@ fn draw_cursor_badge(painter: &egui::Painter, p: Pos2, c: Cursor, t: &Tokens) {
                 painter.line_segment([pos2(c0.x + 2.0, c0.y - 6.0), pos2(c0.x - 2.0, c0.y + 6.0)], ink);
             }
         }
-    }
-}
-
-fn cursor_icon(c: Cursor) -> egui::CursorIcon {
-    use egui::CursorIcon as C;
-    match c {
-        Cursor::Arrow | Cursor::ArrowHollow => C::Default,
-        Cursor::Move => C::Move,
-        Cursor::Crosshair => C::Crosshair,
-        Cursor::ResizeH => C::ResizeHorizontal,
-        Cursor::ResizeV => C::ResizeVertical,
-        Cursor::ResizeNwSe => C::ResizeNwSe,
-        Cursor::ResizeNeSw => C::ResizeNeSw,
-        Cursor::Rotate => C::Alias,
-        Cursor::Pen | Cursor::PenContinue => C::Crosshair,
-        Cursor::PathBracket => C::ResizeColumn,
-        Cursor::Text => C::Text,
-        Cursor::Hand => C::Grab,
-        Cursor::HandGrab => C::Grabbing,
-        Cursor::ZoomIn => C::ZoomIn,
-        Cursor::ZoomOut => C::ZoomOut,
-        Cursor::Eyedropper => C::Crosshair,
-        Cursor::LoadedText | Cursor::LoadedGraphic => C::Copy,
-        Cursor::ThreadLink => C::Alias,
-        Cursor::Unthread => C::NoDrop,
-        Cursor::NotAllowed => C::NotAllowed,
     }
 }
 
@@ -701,6 +708,10 @@ fn draw_guides(app: &DesignApp, painter: &egui::Painter, xf: &Xf, doc: &Document
             painter.rect_stroke(rect(br), 0.0, Stroke::new(hair(painter), c32(s.bleed_color)), StrokeKind::Middle);
         }
         let pasteboard = m.inverse().transform_rect_bbox(layout.pasteboard);
+        let first_abs = match slot.spread {
+            SpreadRef::Doc(si) => Some(doc.first_page_of_spread(si)),
+            _ => None,
+        };
         for (pi, p) in sp.pages.iter().enumerate() {
             let pr = p.bounds();
             // Page tool › Show Parent Page Overlay: the parent page's size over the page.
@@ -716,6 +727,8 @@ fn draw_guides(app: &DesignApp, painter: &egui::Painter, xf: &Xf, doc: &Document
             if !app.ui.guides {
                 continue;
             }
+            // Guides set on the applied parent page show on this page too.
+            let inherited = first_abs.map(|f| doc.inherited_guides(f + pi)).unwrap_or_default();
             // Baseline grid.
             if app.ui.baseline_grid && xf.zoom >= s.baseline_grid.view_threshold {
                 let g = &s.baseline_grid;
@@ -740,7 +753,7 @@ fn draw_guides(app: &DesignApp, painter: &egui::Painter, xf: &Xf, doc: &Document
                     }
                 }
             }
-            for g in p.guides.iter().filter(|g| g.visible_in(doc)) {
+            for g in p.guides.iter().chain(inherited.iter()).filter(|g| g.visible_in(doc)) {
                 // Spread guides cross the pasteboard; page guides their page.
                 let span = if g.spread { pasteboard } else { pr };
                 let (a, bb) = match g.orientation {
@@ -1044,7 +1057,11 @@ fn draw_text_selection(
     cells: Option<designcraft_doc::TableSel>,
 ) {
     let cs = app.session.cache.get(doc, ts.story, None);
-    let range = ts.range();
+    // Text an input method is composing at the caret is marked like it is in every Mac text
+    // field: a yellow box behind the glyphs.
+    let composing = app.session.composition().filter(|c| c.0 == ts.story && c.1 == ts.cell && ts.is_caret()).map(|c| c.2);
+    let range = composing.clone().unwrap_or_else(|| ts.range());
+    let tint = if composing.is_some() { COMPOSING_FILL.gamma_multiply(0.7) } else { Color32::from_rgba_unmultiplied(80, 140, 255, 110) };
     // Selected table cells: tint every selected cell.
     if let Some(sel) = cells.filter(|c| c.story == ts.story) {
         let selected = doc.story(sel.story).and_then(|s| s.tables.get(&sel.table)).map(|t| t.selected_owners(sel.range)).unwrap_or_default();
@@ -1097,7 +1114,7 @@ fn draw_text_selection(
                         let (a, b) = (x0 + (x1 - x0) * k as f64 / n as f64, x0 + (x1 - x0) * (k + 1) as f64 / n as f64);
                         let poly =
                             [Point::new(a, y0), Point::new(b, y0), Point::new(b, y1), Point::new(a, y1)].map(|p| xf.to_screen(m * map.to_path(p)));
-                        painter.add(egui::Shape::convex_polygon(poly.to_vec(), Color32::from_rgba_unmultiplied(80, 140, 255, 110), Stroke::NONE));
+                        painter.add(egui::Shape::convex_polygon(poly.to_vec(), tint, Stroke::NONE));
                     }
                 }
             }
@@ -1133,7 +1150,7 @@ fn draw_text_selection(
         }
     }
     if !runs.is_empty() {
-        draw_inverse_highlight(app, painter, xf, doc, &cs, ts.story, &runs);
+        draw_inverse_highlight(app, painter, xf, doc, &cs, ts.story, &runs, composing.is_some());
     }
     if ts.is_caret()
         && let Some((fi, x, bl, asc, desc)) = compose::caret(&cs, ts.focus)
@@ -1141,22 +1158,38 @@ fn draw_text_selection(
         && let (Some((a, _)), Some(it)) = (item_canvas_xf(doc, layout, ft.frame), doc.item(ft.frame))
     {
         let m = a * doc.text_xf(it);
+        // Type on a path: the caret stands across the path where it is along it.
+        let on = |p: Point| compose::PathTextMap::new(it, ft).map_or(p, |map| map.to_path(p));
+        let p0 = xf.to_screen(m * on(Point::new(x, bl - asc)));
+        let p1 = xf.to_screen(m * on(Point::new(x, bl + desc)));
         let blink = (painter.ctx().input(|i| i.time) * 1.6) as i64 % 2 == 0;
         if blink {
-            // Type on a path: the caret stands across the path where it is along it.
-            let on = |p: Point| compose::PathTextMap::new(it, ft).map_or(p, |map| map.to_path(p));
-            let p0 = xf.to_screen(m * on(Point::new(x, bl - asc)));
-            let p1 = xf.to_screen(m * on(Point::new(x, bl + desc)));
             painter.line_segment([p0, p1], Stroke::new(1.0, Color32::BLACK));
         }
+        remember_ime_caret(painter, p0, p1);
         painter.ctx().request_repaint_after(std::time::Duration::from_millis(330));
     }
+}
+
+/// Where the text caret stood on screen last frame: the OS puts its input-method window there.
+fn ime_caret_id() -> egui::Id {
+    egui::Id::new("canvas_ime_caret")
+}
+
+/// The input method is composing text (sent to `text.compose`) that it hasn't committed.
+fn ime_composing_id() -> egui::Id {
+    egui::Id::new("canvas_ime_composing")
+}
+
+/// Remembers the caret at `p0`–`p1` for the input method's window.
+fn remember_ime_caret(painter: &egui::Painter, p0: egui::Pos2, p1: egui::Pos2) {
+    painter.ctx().data_mut(|d| d.insert_temp(ime_caret_id(), egui::Rect::from_two_pos(p0, p1)));
 }
 
 /// Caret / text highlight inside a table cell (the cell's lines are offset by the cell origin).
 #[allow(clippy::too_many_arguments)]
 fn draw_cell_selection(
-    _app: &DesignApp,
+    app: &DesignApp,
     painter: &egui::Painter,
     xf: &Xf,
     doc: &Document,
@@ -1174,7 +1207,9 @@ fn draw_cell_selection(
     let Some(ft) = cs.frames.get(fi) else { return };
     let (Some((a, _)), Some(it)) = (item_canvas_xf(doc, layout, ft.frame), doc.item(ft.frame)) else { return };
     let m = a * doc.text_xf(it) * designcraft_geom::Affine::translate(origin.to_vec2());
-    let range = ts.range();
+    let composing = app.session.composition().filter(|c| c.0 == ts.story && c.1 == ts.cell && ts.is_caret()).map(|c| c.2);
+    let range = composing.clone().unwrap_or_else(|| ts.range());
+    let tint = if composing.is_some() { COMPOSING_FILL.gamma_multiply(0.6) } else { Color32::from_rgba_unmultiplied(80, 140, 255, 110) };
     if !range.is_empty()
         && let Some(cft) = text.frames.first()
     {
@@ -1187,7 +1222,7 @@ fn draw_cell_selection(
             let past = e == l.range.end && range.end > l.range.end;
             for q in compose::highlight_quads(l, s, e, past) {
                 let poly = q.map(|p| xf.to_screen(m * p));
-                painter.add(egui::Shape::convex_polygon(poly.to_vec(), Color32::from_rgba_unmultiplied(80, 140, 255, 110), Stroke::NONE));
+                painter.add(egui::Shape::convex_polygon(poly.to_vec(), tint, Stroke::NONE));
             }
         }
     }
@@ -1198,20 +1233,25 @@ fn draw_cell_selection(
         }
     {
         let m = a * doc.text_xf(it);
+        let (p0, p1) = (xf.to_screen(m * Point::new(x, bl - asc)), xf.to_screen(m * Point::new(x, bl + desc)));
         let blink = (painter.ctx().input(|i| i.time) * 1.6) as i64 % 2 == 0;
         if blink {
-            painter.line_segment(
-                [xf.to_screen(m * Point::new(x, bl - asc)), xf.to_screen(m * Point::new(x, bl + desc))],
-                Stroke::new(1.0, Color32::BLACK),
-            );
+            painter.line_segment([p0, p1], Stroke::new(1.0, Color32::BLACK));
         }
+        remember_ime_caret(painter, p0, p1);
         painter.ctx().request_repaint_after(std::time::Duration::from_millis(330));
     }
 }
 
+/// The box behind text an input method is composing.
+const COMPOSING_FILL: Color32 = Color32::from_rgb(255, 247, 153);
+
 /// InDesign draws selected text inverted: a black highlight with the selected glyphs in the
 /// inverse of their colour (white for black text). The highlight and glyph outlines are
 /// rasterised with `vello_cpu` into a small screen-space texture over the selection.
+/// `composing`: the text is an input method's, still being composed: a yellow box with the
+/// glyphs in their own colour.
+#[allow(clippy::too_many_arguments)]
 fn draw_inverse_highlight(
     app: &DesignApp,
     painter: &egui::Painter,
@@ -1220,6 +1260,7 @@ fn draw_inverse_highlight(
     cs: &compose::ComposedStory,
     story: designcraft_doc::StoryId,
     runs: &[(usize, Affine, Vec<[Point; 4]>, Vec<(usize, usize)>)],
+    composing: bool,
 ) {
     use designcraft_render::vello_cpu::{self, kurbo, peniko};
     let ctx = painter.ctx();
@@ -1246,7 +1287,7 @@ fn draw_inverse_highlight(
     let Some(st) = app.session.active() else { return };
     let key = egui::Id::new(("inverse_sel", st.uid, st.revision, std::sync::Arc::as_ptr(&st.doc) as usize, story.0))
         .with((runs.iter().map(|r| r.2.len() + r.3.len() * 7919).sum::<usize>(), w, h))
-        .with((bbox.min.x.to_bits(), bbox.min.y.to_bits(), xf.zoom.to_bits(), st.selection.text.map(|t| (t.anchor, t.focus))));
+        .with((bbox.min.x.to_bits(), bbox.min.y.to_bits(), xf.zoom.to_bits(), st.selection.text.map(|t| (t.anchor, t.focus)), composing));
     let cache_id = egui::Id::new("inverse_sel_tex");
     let cached: Option<(egui::Id, egui::TextureHandle)> = ctx.data(|d| d.get_temp(cache_id));
     let tex = match cached {
@@ -1254,7 +1295,8 @@ fn draw_inverse_highlight(
         _ => {
             let view = xf.affine(ppp as f64, bbox.min);
             let mut rc = vello_cpu::RenderContext::new_with(w as u16, h as u16, vello_cpu::RenderSettings { num_threads: 0, ..Default::default() });
-            rc.set_paint(peniko::Color::from_rgba8(0, 0, 0, 255));
+            let [br, bg, bb, _] = if composing { COMPOSING_FILL.to_array() } else { [0, 0, 0, 255] };
+            rc.set_paint(peniko::Color::from_rgba8(br, bg, bb, 255));
             for (_, m, quads, _) in runs {
                 rc.set_transform(view * *m);
                 for q in quads {
@@ -1275,8 +1317,12 @@ fn draw_inverse_highlight(
                     let Some(g) = l.glyphs.get(gi) else { continue };
                     let Some(style) = cs.styles.get(g.style as usize) else { continue };
                     let Some(c) = doc.resolve_color(&style.fill, style.fill_tint) else { continue };
-                    let [r, gg, b, _] = c.to_rgba8(1.0);
-                    rc.set_paint(peniko::Color::from_rgba8(255 - r, 255 - gg, 255 - b, 255));
+                    let [r, gg, b, a] = c.to_rgba8(1.0);
+                    if composing {
+                        rc.set_paint(peniko::Color::from_rgba8(r, gg, b, a));
+                    } else {
+                        rc.set_paint(peniko::Color::from_rgba8(255 - r, 255 - gg, 255 - b, 255));
+                    }
                     let outline = db.outline(&g.face, g.gid);
                     let skew =
                         if style.skew != 0.0 { Affine::new([1.0, 0.0, -style.skew.to_radians().tan(), 1.0, 0.0, 0.0]) } else { Affine::IDENTITY };
@@ -1664,11 +1710,40 @@ fn handle_input(app: &mut DesignApp, ui: &mut egui::Ui, resp: &egui::Response, r
     if app.pane != app.focus_pane || (ui.ctx().text_edit_focused() && !resp.has_focus()) {
         return;
     }
+    // The engine drops composed text when something else edits or the caret moves; the input
+    // method must forget it too, or the next key would finish an accent that is gone.
+    let composing = ui.data(|d| d.get_temp::<bool>(ime_composing_id())).unwrap_or(false);
+    let interrupt = composing && app.session.composition().is_none();
+    if interrupt || !wants_text {
+        ui.data_mut(|d| d.remove::<bool>(ime_composing_id()));
+    }
+    if wants_text {
+        // Turn the OS input method on: macOS composes dead keys (⌥E then I types í) and
+        // Japanese/Chinese input only for a window that asks for it. Without it ⌥E typed "e".
+        let cursor_rect = ui.data(|d| d.get_temp(ime_caret_id())).unwrap_or(egui::Rect::from_min_size(rect.min, egui::Vec2::ZERO));
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect, cursor_rect, should_interrupt_composition: interrupt });
+        });
+    }
     let evs = ui.input(|i| i.events.clone());
     for e in evs {
         match e {
             egui::Event::Text(t) if wants_text => {
                 let _ = app.run("text.insert", json!({"text": t}));
+            }
+            // What is composed shows in the story, in the text's own format, until it commits.
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if wants_text => {
+                let on = !text.is_empty();
+                if app.run("text.compose", json!({"text": text})).is_ok() {
+                    ui.data_mut(|d| d.insert_temp(ime_composing_id(), on));
+                }
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(t)) if wants_text => {
+                ui.data_mut(|d| d.remove::<bool>(ime_composing_id()));
+                let _ = app.run("text.compose", json!({"text": ""}));
+                if !t.is_empty() {
+                    let _ = app.run("text.insert", json!({"text": t}));
+                }
             }
             egui::Event::Paste(t) if wants_text => {
                 // Formatted when the system clipboard still holds what was copied here;
@@ -2340,6 +2415,64 @@ mod tests {
             h.run_steps(30);
         }
         assert!(selected(&h).is_empty(), "three clicks half a second apart leave a caret: {:?}", selected(&h));
+    }
+
+    /// ⌥E then I types "í" on a Mac: the input method composes the dead key's accent, which
+    /// it does only for a window that turned it on. The canvas never did, so ⌥E typed "e".
+    #[test]
+    fn dead_keys_compose_through_the_input_method() {
+        let (mut h, id) = typing("T");
+        h.state_mut().run("text.placeCaret", json!({"frame": id, "point": [390.0, 80.0]})).unwrap();
+        h.run_steps(2);
+        assert!(h.output().platform_output.ime.is_some(), "a text caret turns the input method on");
+        h.event(egui::Event::Ime(egui::ImeEvent::Preedit { text: "´".into(), active_range_chars: None }));
+        h.run_steps(2);
+        let text = |h: &Harness<'_, DesignApp>| h.state().session.doc().unwrap().doc.stories.values().map(|s| s.text.clone()).collect::<String>();
+        assert_eq!(text(&h), "T´", "the accent being composed shows in the story, in its format");
+        assert!(h.state().session.composition().is_some(), "and is marked as composed, not typed");
+        h.event(egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }));
+        h.event(egui::Event::Ime(egui::ImeEvent::Commit("í".into())));
+        h.run_steps(2);
+        assert_eq!(text(&h), "Tí");
+        assert!(h.state().session.composition().is_none());
+        // Moving the caret mid-composition drops the accent and tells the input method so.
+        h.event(egui::Event::Ime(egui::ImeEvent::Preedit { text: "˜".into(), active_range_chars: None }));
+        h.run_steps(2);
+        h.state_mut().run("text.move", json!({"dir": "left"})).unwrap();
+        h.step();
+        assert_eq!(text(&h), "Tí");
+        assert!(h.output().platform_output.ime.as_ref().is_some_and(|i| i.should_interrupt_composition));
+        // Another tool takes no text: the input method is off.
+        h.state_mut().run("tool.select", json!({"tool": "selection"})).unwrap();
+        h.run_steps(2);
+        assert!(h.output().platform_output.ime.is_none());
+    }
+
+    #[test]
+    fn tools_show_their_own_cursors_over_the_page() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let mut h = harness(app);
+        let p = h.state().canvas_rect.unwrap().center();
+        let mut shown = |tool: &str| {
+            h.state_mut().run("tool.select", json!({"tool": tool})).unwrap();
+            h.hover_at(p);
+            h.run_steps(2);
+            let out = &h.output().platform_output;
+            (out.cursor_icon, out.cursor_image.clone())
+        };
+        let (pen, direct, text) = (shown("pen"), shown("directSelection"), shown("type"));
+        let ppp = h.ctx.pixels_per_point();
+        let images = &mut h.state_mut().cursors;
+        match crate::cursors::MODE {
+            crate::cursors::Mode::Os => {
+                assert_eq!(pen.1, images.get(Cursor::Pen, ppp), "Pen");
+                assert_eq!(direct.1, images.get(Cursor::ArrowHollow, ppp), "Direct Selection");
+                assert_eq!(text, (egui::CursorIcon::Text, None), "the I-beam stays a system cursor");
+            }
+            crate::cursors::Mode::Painted => assert_eq!((pen.0, direct.0), (egui::CursorIcon::None, egui::CursorIcon::None)),
+            crate::cursors::Mode::System => assert_eq!(pen, (egui::CursorIcon::Crosshair, None)),
+        }
     }
 
     #[test]

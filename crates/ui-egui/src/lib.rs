@@ -11,6 +11,7 @@ pub mod canvas;
 pub mod chrome;
 pub mod control;
 pub mod credits;
+pub mod cursors;
 pub mod dialogs;
 pub mod dock;
 pub mod i18n;
@@ -565,6 +566,8 @@ pub struct DesignApp {
     pub(crate) quit_without_asking: bool,
     /// No document is discarded until every unsaved document has an up-to-date approval.
     quitting: Option<QuitState>,
+    /// The tool cursor bitmaps handed to the OS.
+    pub cursors: cursors::Images,
 }
 
 struct QuitState {
@@ -618,6 +621,7 @@ impl DesignApp {
             quit_requested: false,
             quit_without_asking: false,
             quitting: None,
+            cursors: cursors::Images::default(),
         }
     }
 
@@ -924,6 +928,9 @@ impl DesignApp {
             ctx.set_zoom_factor(scale);
         }
         if !self.styled {
+            // The UI scale is a preference (applied above); egui's own Cmd+Plus/Minus/0 would rescale the
+            // whole window instead of the canvas, only to be reset next frame.
+            ctx.options_mut(|o| o.zoom_with_keyboard = false);
             self.fonts_system = theme::install_fonts(ctx, &self.ui.language);
             self.fonts_lang = self.ui.language.clone();
             self.styled = true;
@@ -1128,8 +1135,9 @@ impl DesignApp {
         }
     }
 
-    /// A file dropped on the window: documents open, anything else is placed on the spread in
-    /// view (a parent spread while parents are being edited).
+    /// A file dropped on the window: documents open, the swatches in a swatch exchange (.ase) file
+    /// are loaded, and anything else is placed on the spread in view (a parent spread while parents
+    /// are being edited).
     pub fn open_dropped(&mut self, path: &str) -> Result<Value, String> {
         self.open_dropped_at(path, None)
     }
@@ -1137,6 +1145,9 @@ impl DesignApp {
     /// [`Self::open_dropped`] at the pointer: a graphic's top left lands where the file was
     /// dropped on the canvas, text goes to a new frame on the page there.
     pub fn open_dropped_at(&mut self, path: &str, pointer: Option<egui::Pos2>) -> Result<Value, String> {
+        if path.to_ascii_lowercase().ends_with(".ase") {
+            return self.run("swatch.load", json!({"path": path}));
+        }
         if opens_as_document(path) {
             return self.open_file("file.open", json!({"path": path}));
         }
@@ -2126,6 +2137,28 @@ mod tests {
         let d = &app.session.doc().unwrap().doc;
         assert_eq!(d.parents[0].items.len(), 1, "the graphic is on the parent spread");
         assert!(d.spreads.iter().all(|s| s.items.is_empty()), "no document page gets it");
+    }
+
+    #[test]
+    fn dropping_an_ase_file_loads_its_swatches() {
+        let mut source = Session::new();
+        source.execute("file.new", &json!({})).unwrap();
+        source.execute("swatch.create", &json!({"name": "Dropped Teal", "color": "#108080"})).unwrap();
+        let data = source.execute("swatch.save", &json!({"names": ["Dropped Teal"]})).unwrap();
+        let bytes = designcraft_engine::cmd::base64_decode(data["base64"].as_str().unwrap());
+        for name in ["palette.ase", "PALETTE.ASE"] {
+            let path = std::env::temp_dir().join(format!("designcraft-ui-{}-{name}", std::process::id()));
+            std::fs::write(&path, &bytes).unwrap();
+            let mut app = DesignApp::new(Session::new(), Services::default());
+            app.run("file.new", json!({})).unwrap();
+            let r = app.open_dropped(&path.to_string_lossy());
+            let _ = std::fs::remove_file(&path);
+            assert!(app.ui.dialog.is_none(), "{name}: {:?}", app.ui.dialog.as_ref().map(|d| &d.fields));
+            assert_eq!(r, Ok(json!({"added": 1, "replaced": 0})), "{name}");
+            let doc = &app.session.doc().unwrap().doc;
+            assert!(doc.swatches.iter().any(|s| s.name == "Dropped Teal"), "{name}");
+            assert!(doc.assets.is_empty(), "{name} isn't placed");
+        }
     }
 
     #[test]

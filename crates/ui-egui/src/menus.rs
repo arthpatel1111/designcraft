@@ -513,6 +513,13 @@ pub const MENUS: &[(&str, &[&str])] = &[
             "cmd:transform.again|Transform Sequence Again|{\"sequence\": true}",
             "cmd:transform.again|Transform Sequence Again Individually|{\"sequence\": true, \"individually\": true}",
             "<",
+            ">Flex Layout",
+            "cmd:flex.add",
+            "cmd:flex.convert",
+            "cmd:flex.remove",
+            "-",
+            "ui:window.panel|Show Flex Controls|{\"panel\": \"flexLayout\"}",
+            "<",
             ">Paths",
             "cmd:object.makeCompoundPath",
             "cmd:object.releaseCompoundPath",
@@ -764,6 +771,7 @@ pub const MENUS: &[(&str, &[&str])] = &[
             "ui:window.panel|Links|{\"panel\": \"links\"}",
             ">Object & Layout",
             "ui:window.panel|Align|{\"panel\": \"align\"}",
+            "ui:window.panel|Flex Layout|{\"panel\": \"flexLayout\"}",
             "ui:window.panel|Pathfinder|{\"panel\": \"pathfinder\"}",
             "<",
             ">Output",
@@ -2052,6 +2060,14 @@ fn activate_inner(app: &mut DesignApp, id: &str, params: &Value) {
         crate::dialogs::open_print(app);
         return;
     }
+    if params.is_null() && id == "layout.createGuides" {
+        crate::dialogs::open_create_guides(app);
+        return;
+    }
+    if params.is_null() && id == "layout.marginsAndColumns" {
+        crate::dialogs::open_margins_and_columns(app);
+        return;
+    }
     if params.is_null() && id == "object.textFrameOptions" {
         app.ui.dialog = Some(crate::dialogs::Dialog::new("textFrameOptions", json!({})));
         return;
@@ -2080,6 +2096,11 @@ fn activate_inner(app: &mut DesignApp, id: &str, params: &Value) {
         return;
     }
     let p = if params.is_null() { json!({}) } else { params.clone() };
+    // Update Link asks before replacing edits made to linked text in the layout.
+    if id == "links.update" {
+        crate::panels::properties::update_links(app, p);
+        return;
+    }
     let _ = app.run(id, p);
 }
 
@@ -2337,10 +2358,12 @@ pub fn shortcuts(app: &mut DesignApp, ctx: &egui::Context) {
         let all = effective_shortcuts(app);
         for (id, sc) in &all {
             let id = id.as_str();
+            // On layouts with a dedicated + key (German) or Shift+= (US), Cmd+= arrives as Plus.
+            let plus_for_equals = key == egui::Key::Plus;
             if let Some((m, k)) = parse_shortcut(sc)
-                && k == key
+                && (k == key || (plus_for_equals && k == egui::Key::Equals))
                 && m.command == modifiers.command
-                && m.shift == modifiers.shift
+                && (m.shift == modifiers.shift || (plus_for_equals && !m.shift))
                 && m.alt == modifiers.alt
                 && (m.command || m.alt || !typing)
                 && !(id == "edit.clear" && typing)
@@ -3313,6 +3336,49 @@ mod tests {
         assert_eq!(app.session.tool_id(), "selection", "V switches tools straight after drawing");
         frame(&mut app, key(egui::Key::F));
         assert_eq!(app.session.tool_id(), "rectangleFrame");
+    }
+
+    #[test]
+    fn cmd_plus_zooms_the_canvas_not_the_window() {
+        // A German keyboard has its own + key, so Cmd+= arrives as Plus; it must zoom the canvas like
+        // Cmd+- does, not hand the key to egui's whole-window zoom.
+        let mut app = crate::DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.session.execute("file.new", &json!({})).unwrap();
+        let ctx = egui::Context::default();
+        let frame = |app: &mut crate::DesignApp, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                app.logic(&ui.ctx().clone());
+                app.ui(ui);
+            });
+            out.textures_delta.clear();
+        };
+        let key = |k: egui::Key, modifiers: egui::Modifiers| {
+            vec![
+                egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers },
+                egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers },
+            ]
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        let scale = ctx.zoom_factor();
+        for (k, m, zooms_in) in [
+            (egui::Key::Plus, egui::Modifiers::COMMAND, true),
+            (egui::Key::Plus, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, true),
+            (egui::Key::Equals, egui::Modifiers::COMMAND, true),
+            (egui::Key::Minus, egui::Modifiers::COMMAND, false),
+        ] {
+            let z0 = app.view().unwrap().zoom;
+            frame(&mut app, key(k, m));
+            frame(&mut app, vec![]);
+            let z = app.view().unwrap().zoom;
+            assert!(if zooms_in { z > z0 } else { z < z0 }, "{k:?} {m:?}: {z0} -> {z}");
+            assert_eq!(ctx.zoom_factor(), scale, "{k:?} {m:?} leaves the UI scale alone");
+        }
     }
 
     #[test]
